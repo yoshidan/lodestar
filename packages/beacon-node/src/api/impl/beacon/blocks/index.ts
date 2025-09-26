@@ -649,11 +649,12 @@ export function getBeaconBlockApi({
           const firstSidecar = dataColumnSidecars[0];
           const signedBlockHeader = firstSidecar.signedBlockHeader;
 
-          // For post-Fulu, we need to convert kzgCommitmentsInclusionProof to individual proofs
-          // Each blob needs its own inclusion proof
+          // For post-Fulu, we need to compute blob proofs from reconstructed blobs
+          // The kzgProofs in dataColumnSidecars are cell proofs, not blob proofs
           blobSidecars = blobs.map((blob: deneb.Blob, index: number) => {
             const kzgCommitment = firstSidecar.kzgCommitments[index];
-            const kzgProof = firstSidecar.kzgProofs[index];
+            // Compute the blob proof from the reconstructed blob
+            const kzgProof = kzg.computeBlobKzgProof(blob, kzgCommitment);
 
             // Compute the individual inclusion proof for this blob
             const kzgCommitmentInclusionProof = computePreFuluKzgCommitmentsInclusionProof(
