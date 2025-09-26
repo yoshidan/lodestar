@@ -42,7 +42,12 @@ import {
 } from "../../../../chain/produceBlock/index.js";
 import {validateGossipBlock} from "../../../../chain/validation/block.js";
 import {OpSource} from "../../../../chain/validatorMonitor.js";
-import {getBlobSidecars, kzgCommitmentToVersionedHash, reconstructBlobs} from "../../../../util/blobs.js";
+import {
+  computePreFuluKzgCommitmentsInclusionProof,
+  getBlobSidecars,
+  kzgCommitmentToVersionedHash,
+  reconstructBlobs,
+} from "../../../../util/blobs.js";
 import {getDataColumnSidecarsFromBlock} from "../../../../util/dataColumns.js";
 import {isOptimisticBlock} from "../../../../util/forkChoice.js";
 import {kzg} from "../../../../util/kzg.js";
@@ -610,16 +615,75 @@ export function getBeaconBlockApi({
 
       const {block, executionOptimistic, finalized} = await getBlockResponse(chain, blockId);
       const fork = config.getForkName(block.message.slot);
-
-      if (isForkPostFulu(fork)) {
-        throw new ApiError(400, `Use getBlobs to retrieve blobs for post-fulu fork=${fork}`);
-      }
-
       const blockRoot = sszTypesFor(fork).BeaconBlock.hashTreeRoot(block.message);
 
-      let {blobSidecars} = (await db.blobSidecars.get(blockRoot)) ?? {};
-      if (!blobSidecars) {
-        ({blobSidecars} = (await db.blobSidecarsArchive.get(block.message.slot)) ?? {});
+      let blobSidecars: deneb.BlobSidecars | undefined;
+
+      if (isForkPostFulu(fork)) {
+        // For post-Fulu fork, reconstruct blobSidecars from dataColumnSidecars
+        const {targetCustodyGroupCount} = chain.custodyConfig;
+        if (targetCustodyGroupCount < NUMBER_OF_COLUMNS / 2) {
+          throw Error(
+            `Custody group count of ${targetCustodyGroupCount} is not sufficient to serve blobs, must custody at least ${NUMBER_OF_COLUMNS / 2} data columns`
+          );
+        }
+
+        const blobCount = (block.message.body as deneb.BeaconBlockBody).blobKzgCommitments.length;
+
+        if (blobCount > 0) {
+          let dataColumnSidecars = await fromAsync(db.dataColumnSidecar.valuesStream(blockRoot));
+          if (dataColumnSidecars.length === 0) {
+            dataColumnSidecars = await fromAsync(db.dataColumnSidecarArchive.valuesStream(block.message.slot));
+          }
+
+          if (dataColumnSidecars.length === 0) {
+            throw Error(
+              `dataColumnSidecars not found in db for slot=${block.message.slot} root=${toRootHex(blockRoot)} blobs=${blobCount}`
+            );
+          }
+
+          // Reconstruct blobs from dataColumnSidecars
+          const blobs = await reconstructBlobs(dataColumnSidecars);
+
+          // Create blobSidecars from reconstructed blobs using data from the first dataColumnSidecar
+          const firstSidecar = dataColumnSidecars[0];
+          const signedBlockHeader = firstSidecar.signedBlockHeader;
+
+          // For post-Fulu, we need to convert kzgCommitmentsInclusionProof to individual proofs
+          // Each blob needs its own inclusion proof
+          blobSidecars = blobs.map((blob: deneb.Blob, index: number) => {
+            const kzgCommitment = firstSidecar.kzgCommitments[index];
+            const kzgProof = firstSidecar.kzgProofs[index];
+
+            // Compute the individual inclusion proof for this blob
+            const kzgCommitmentInclusionProof = computePreFuluKzgCommitmentsInclusionProof(
+              fork,
+              block.message.body,
+              index
+            );
+
+            return {
+              index,
+              blob,
+              kzgCommitment,
+              kzgProof,
+              signedBlockHeader,
+              kzgCommitmentInclusionProof,
+            };
+          });
+        } else {
+          blobSidecars = [];
+        }
+      } else {
+        // For pre-Fulu fork, use existing logic
+        let blobSidecarsWrapper = await db.blobSidecars.get(blockRoot);
+        if (!blobSidecarsWrapper) {
+          blobSidecarsWrapper = await db.blobSidecarsArchive.get(block.message.slot);
+        }
+
+        if (blobSidecarsWrapper) {
+          blobSidecars = blobSidecarsWrapper.blobSidecars;
+        }
       }
 
       if (!blobSidecars) {
