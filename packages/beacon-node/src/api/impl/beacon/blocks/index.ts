@@ -702,6 +702,9 @@ export function getBeaconBlockApi({
     },
 
     async getBlobs({blockId, versionedHashes}) {
+
+      throw new ApiError(500, "temporarily disabled");
+
       assertUniqueItems(versionedHashes, "Duplicate versioned hashes provided");
 
       const {block, executionOptimistic, finalized} = await getBlockResponse(chain, blockId);
